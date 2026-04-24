@@ -1,9 +1,11 @@
 package main
 
 import (
+	"archive/zip"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"time"
@@ -181,7 +183,7 @@ func servePageRequest(
 		return err
 	}
 
-	pageBytes, err := os.ReadFile(page.Path)
+	pageBytes, err := readHostedPage(page)
 	if err != nil {
 		return hostConn.writeJSON(PageErrorMessage{
 			Type:      "page_error",
@@ -223,4 +225,36 @@ func (c *hostConnection) writeBinary(payload []byte) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	return c.conn.WriteMessage(websocket.BinaryMessage, payload)
+}
+
+func readHostedPage(page HostedPage) ([]byte, error) {
+	if page.ArchivePath == "" {
+		return os.ReadFile(page.Path)
+	}
+
+	archiveReader, err := zip.OpenReader(page.ArchivePath)
+	if err != nil {
+		return nil, fmt.Errorf("open cbz %s: %w", page.ArchivePath, err)
+	}
+	defer archiveReader.Close()
+
+	for _, file := range archiveReader.File {
+		if file.Name != page.ArchiveEntry {
+			continue
+		}
+
+		reader, err := file.Open()
+		if err != nil {
+			return nil, fmt.Errorf("open cbz entry %s::%s: %w", page.ArchivePath, page.ArchiveEntry, err)
+		}
+		defer reader.Close()
+
+		pageBytes, err := io.ReadAll(reader)
+		if err != nil {
+			return nil, fmt.Errorf("read cbz entry %s::%s: %w", page.ArchivePath, page.ArchiveEntry, err)
+		}
+		return pageBytes, nil
+	}
+
+	return nil, fmt.Errorf("cbz entry not found: %s::%s", page.ArchivePath, page.ArchiveEntry)
 }

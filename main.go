@@ -73,8 +73,8 @@ func main() {
 
 func defaultConfigPath() string {
 	candidates := []string{
+		"config.json",
 		"../hoster/config.json",
-		"hoster/config.json",
 	}
 
 	for _, candidate := range candidates {
@@ -83,5 +83,5 @@ func defaultConfigPath() string {
 		}
 	}
 
-	return filepath.Join("..", "hoster", "config.json")
+	return filepath.Join("config.json")
 }

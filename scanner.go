@@ -1,7 +1,9 @@
 package main
 
 import (
+	"archive/zip"
 	"fmt"
+	"io"
 	"mime"
 	"os"
 	"path/filepath"
@@ -12,14 +14,17 @@ import (
 
 var (
 	imageExtensions      = map[string]struct{}{".jpg": {}, ".jpeg": {}, ".png": {}, ".webp": {}}
+	archiveExtensions    = map[string]struct{}{".cbz": {}}
 	ignoredDirectoryName = map[string]struct{}{"_cbz_backups": {}, "__pycache__": {}}
 	volumeNumberPattern  = regexp.MustCompile(`(\d+)`)
 	slugPattern          = regexp.MustCompile(`[^a-z0-9]+`)
 )
 
 type HostedPage struct {
-	Path        string
-	ContentType string
+	Path         string
+	ArchivePath  string
+	ArchiveEntry string
+	ContentType  string
 }
 
 type ManifestSummary struct {
@@ -89,15 +94,34 @@ func scanSeries(rootPath string) (ManifestSeries, map[string]HostedPage, error) 
 	})
 
 	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		if _, ignored := ignoredDirectoryName[entry.Name()]; ignored {
+		if entry.IsDir() {
+			if _, ignored := ignoredDirectoryName[entry.Name()]; ignored {
+				continue
+			}
+
+			volumePath := filepath.Join(rootPath, entry.Name())
+			volume, pages, err := scanDirectoryVolume(seriesID, volumePath, entry.Name())
+			if err != nil {
+				return ManifestSeries{}, nil, err
+			}
+			if len(volume.Pages) == 0 {
+				continue
+			}
+
+			series.Volumes = append(series.Volumes, volume)
+			for pageID, page := range pages {
+				pageLookup[pageID] = page
+			}
 			continue
 		}
 
-		volumePath := filepath.Join(rootPath, entry.Name())
-		volume, pages, err := scanVolume(seriesID, volumePath, entry.Name())
+		if _, ok := archiveExtensions[strings.ToLower(filepath.Ext(entry.Name()))]; !ok {
+			continue
+		}
+
+		archivePath := filepath.Join(rootPath, entry.Name())
+		archiveName := strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name()))
+		volume, pages, err := scanArchiveVolume(seriesID, archivePath, archiveName)
 		if err != nil {
 			return ManifestSeries{}, nil, err
 		}
@@ -114,7 +138,7 @@ func scanSeries(rootPath string) (ManifestSeries, map[string]HostedPage, error) 
 	return series, pageLookup, nil
 }
 
-func scanVolume(seriesID, volumePath, volumeTitle string) (ManifestVolume, map[string]HostedPage, error) {
+func scanDirectoryVolume(seriesID, volumePath, volumeTitle string) (ManifestVolume, map[string]HostedPage, error) {
 	volumeNumber := parseVolumeNumber(volumeTitle)
 	volumeID := buildVolumeID(seriesID, volumeNumber, volumeTitle)
 
@@ -182,6 +206,88 @@ func scanVolume(seriesID, volumePath, volumeTitle string) (ManifestVolume, map[s
 	}
 
 	return volume, pageLookup, nil
+}
+
+func scanArchiveVolume(seriesID, archivePath, volumeTitle string) (ManifestVolume, map[string]HostedPage, error) {
+	archiveReader, err := zip.OpenReader(archivePath)
+	if err != nil {
+		return ManifestVolume{}, nil, fmt.Errorf("open cbz %s: %w", archivePath, err)
+	}
+	defer archiveReader.Close()
+
+	volumeNumber := parseVolumeNumber(volumeTitle)
+	volumeID := buildVolumeID(seriesID, volumeNumber, volumeTitle)
+
+	imageFiles := make([]*zip.File, 0)
+	for _, file := range archiveReader.File {
+		if file.FileInfo().IsDir() {
+			continue
+		}
+		if _, ok := imageExtensions[strings.ToLower(filepath.Ext(file.Name))]; ok {
+			imageFiles = append(imageFiles, file)
+		}
+	}
+
+	sort.Slice(imageFiles, func(i, j int) bool {
+		return imageFiles[i].Name < imageFiles[j].Name
+	})
+
+	volume := ManifestVolume{
+		ID:           volumeID,
+		SeriesID:     seriesID,
+		Title:        volumeTitle,
+		VolumeNumber: volumeNumber,
+		PageCount:    len(imageFiles),
+		Pages:        make([]ManifestPage, 0, len(imageFiles)),
+	}
+	pageLookup := make(map[string]HostedPage, len(imageFiles))
+
+	for index, file := range imageFiles {
+		pageID := fmt.Sprintf("%s-p%03d", volumeID, index+1)
+		contentType := mime.TypeByExtension(strings.ToLower(filepath.Ext(file.Name)))
+		if contentType == "" {
+			contentType = "application/octet-stream"
+		}
+
+		fileSize, err := archiveFileSize(file)
+		if err != nil {
+			return ManifestVolume{}, nil, fmt.Errorf("read cbz entry size %s::%s: %w", archivePath, file.Name, err)
+		}
+
+		volume.Pages = append(volume.Pages, ManifestPage{
+			ID:          pageID,
+			VolumeID:    volumeID,
+			Index:       index + 1,
+			FileName:    filepath.Base(file.Name),
+			ContentType: contentType,
+			FileSize:    fileSize,
+		})
+		pageLookup[pageID] = HostedPage{
+			ArchivePath:  archivePath,
+			ArchiveEntry: file.Name,
+			ContentType:  contentType,
+		}
+	}
+
+	return volume, pageLookup, nil
+}
+
+func archiveFileSize(file *zip.File) (int64, error) {
+	if file.UncompressedSize64 > 0 {
+		return int64(file.UncompressedSize64), nil
+	}
+
+	reader, err := file.Open()
+	if err != nil {
+		return 0, err
+	}
+	defer reader.Close()
+
+	written, err := io.Copy(io.Discard, reader)
+	if err != nil {
+		return 0, err
+	}
+	return written, nil
 }
 
 func slugify(value string) string {
