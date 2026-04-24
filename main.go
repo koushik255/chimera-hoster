@@ -72,10 +72,16 @@ func main() {
 }
 
 func defaultConfigPath() string {
-	candidates := []string{
+	candidates := make([]string, 0, 3)
+
+	if executablePath, err := os.Executable(); err == nil {
+		candidates = append(candidates, filepath.Join(filepath.Dir(executablePath), "config.json"))
+	}
+
+	candidates = append(candidates,
 		"config.json",
 		"../hoster/config.json",
-	}
+	)
 
 	for _, candidate := range candidates {
 		if _, err := os.Stat(candidate); err == nil {
@@ -83,5 +89,8 @@ func defaultConfigPath() string {
 		}
 	}
 
-	return filepath.Join("config.json")
+	if len(candidates) > 0 {
+		return candidates[0]
+	}
+	return "config.json"
 }
